@@ -1,0 +1,522 @@
+package edu.lehigh.cse.paclab.gameframework;
+
+import java.io.BufferedInputStream;
+import java.io.InputStream;
+
+import javax.xml.parsers.SAXParser;
+import javax.xml.parsers.SAXParserFactory;
+
+import org.anddev.andengine.entity.modifier.PathModifier.Path;
+import org.anddev.andengine.entity.scene.Scene;
+import org.anddev.andengine.extension.physics.box2d.PhysicsFactory;
+import org.anddev.andengine.extension.physics.box2d.util.constants.PhysicsConstants;
+import org.anddev.andengine.input.touch.TouchEvent;
+import org.anddev.andengine.opengl.texture.region.TiledTextureRegion;
+import org.xml.sax.InputSource;
+import org.xml.sax.XMLReader;
+
+import android.content.res.AssetManager;
+import android.view.MotionEvent;
+
+import com.badlogic.gdx.math.Vector2;
+import com.badlogic.gdx.physics.box2d.BodyDef.BodyType;
+
+/**
+ * Obstacles are entities that change the hero's velocity upon a collision
+ * 
+ * There are many flavors of obstacles. They can have a physics shape that is
+ * circular or square. They can have default collision behavior or custom
+ * behavior. They can be moved by dragging. They can move by touching the object
+ * and then touching a point on the screen. They can have "damp" behavior, which
+ * is a way to do tricks with Physics (such as zoom strips or friction pads). A
+ * method for drawing bounding boxes on the screen is also available, as is a
+ * means of creating "trigger" obstacles that cause user-specified code to run
+ * upon any collision. There is also a simple object type for loading SVG files,
+ * such as those created by Inkscape.
+ * 
+ * @author spear
+ */
+public class Obstacle extends PhysicsSprite
+{
+    /**
+     * When a sprite is poked, we record it here so that we know who to move on
+     * the next screen touch
+     */
+    private static Obstacle currentSprite;
+
+    /**
+     * When a sprite is poked, remember the time, because rapid double-clicks
+     * cause deletion
+     */
+    private static float lastPokeTime;
+
+    /**
+     * Rather than use a Vector2 pool, we'll keep a vector around for all poke
+     * operations
+     */
+    private final static Vector2 pokeVector = new Vector2();
+
+    /**
+     * Tunable constant for how much time between pokes constitutes a
+     * "double click"
+     */
+    private final static float pokeDeleteThresh = 0.5f;
+
+    /**
+     * Rather than use a Vector2 pool, we'll keep a vector around for drag
+     * operations
+     */
+    private static final Vector2 dragVector = new Vector2();
+
+    /**
+     * Track if the obstacle has an active "dampening" factor for custom physics
+     * tricks
+     */
+    boolean isDamp;
+
+    /**
+     * The dampening factor of this obstacle
+     */
+    float dampFactor;
+
+    /**
+     * Track if the object is draggable
+     */
+    private boolean isDrag = false;
+
+    /**
+     * Track if the object is pokable
+     */
+    private boolean isPoke = false;
+
+    /**
+     * Track if this is a "trigger" object that causes special code to run upon
+     * any collision
+     */
+    boolean isTrigger = false;
+
+    /**
+     * Triggers can require a certain Goodie count in order to run, as
+     * represented by this field
+     */
+    int triggerActivation = 0;
+
+    /**
+     * An ID for each trigger object, in case it's useful
+     */
+    int triggerID;
+
+    /**
+     * Internal constructor to build an Obstacle.
+     * 
+     * This should never be invoked directly. Instead, use the 'addXXX' methods
+     * of the Object class.
+     * 
+     * @param x
+     *            X position of top left corner
+     * @param y
+     *            Y position of top left corner
+     * @param width
+     *            width of this Obstacle
+     * @param height
+     *            height of this Obstacle
+     * @param ttr
+     *            image to use for this Obstacle
+     */
+    private Obstacle(float x, float y, float width, float height, TiledTextureRegion ttr)
+    {
+        super(x, y, width, height, ttr, PhysicsSprite.TYPE_OBSTACLE);
+    }
+
+    /**
+     * Call this on an Obstacle to make it draggable.
+     * 
+     * Be careful when dragging Obstacles. If they are small, they will be hard
+     * to touch.
+     */
+    void enableDrag()
+    {
+        isDrag = true;
+        Level.current.registerTouchArea(this);
+        Level.current.setTouchAreaBindingEnabled(true);
+    }
+
+    /**
+     * Call this on an Obstacle to rotate it
+     * 
+     * @param rotation
+     *            amount to rotate the Obstacle (in degrees)
+     */
+    void rotate(float rotation)
+    {
+        // rotate it
+        physBody.setTransform(physBody.getPosition(), rotation);
+        setRotation(rotation);
+    }
+
+    /**
+     * Call this on an Obstacle to make it pokeable
+     * 
+     * Poke the Obstacle, then poke the screen, and the Obstacle will move to
+     * the location that was pressed. Poke the Obstacle twice in rapid
+     * succession to delete the Obstacle.
+     */
+    void enablePoke()
+    {
+        isPoke = true;
+        Level.current.registerTouchArea(this);
+        Level.current.setTouchAreaBindingEnabled(true);
+        Level.current.setOnSceneTouchListener(Framework.self());
+    }
+
+    /**
+     * Call this on an Obstacle to give it a dampening factor.
+     * 
+     * A hero can glide over damp Obstacles. Damp factors can be negative to
+     * cause a reverse direction, less than 1 to cause a slowdown (friction
+     * pads), or greater than 1 to serve as zoom pads.
+     * 
+     * @param factor
+     *            Value to multiply the hero's velocity when it is on this
+     *            Obstacle
+     */
+    void setDamp(float factor)
+    {
+        // We have the fixtureDef for this object, but it's the Fixture that we
+        // really need to modify. Find it, and set it to be a sensor
+        physBody.getFixtureList().get(0).setSensor(true);
+        // set damp info
+        dampFactor = factor;
+        isDamp = true;
+    }
+
+    /**
+     * Make the object a trigger object, so that custom code will run when a
+     * hero runs over (or under) it
+     * 
+     * @param activationGoodies
+     *            Number of goodies that must be collected before this trigger
+     *            works
+     * @param id
+     *            identifier for the trigger
+     */
+    void setTrigger(int activationGoodies, int id)
+    {
+        triggerID = id;
+        isTrigger = true;
+        triggerActivation = activationGoodies;
+        physBody.getFixtureList().get(0).setSensor(true);
+    }
+
+    /**
+     * Draw an obstacle on the screen. The obstacle's underlying physics shape
+     * is circular.
+     * 
+     * All obstacle behaviors begin by creating an obstacle, using either this
+     * or addSquareObstacle. Then, methods applied to the result can be used to
+     * modify the Obstacle's behavior
+     * 
+     * @param x
+     *            X coordinate of top left corner
+     * @param y
+     *            X coordinate of top left corner
+     * @param width
+     *            Width of the obstacle
+     * @param height
+     *            Height of the obstacle
+     * @param name
+     *            Name of the image file to use
+     * @param path
+     *            a Path object to describe how the obstacle moves, or null if
+     *            no path is desired
+     * @param pathDuration
+     *            The amount of time it takes for the path to complete, or 0 if
+     *            the path is null
+     * @param density
+     *            Density of the obstacle. When in doubt, use 1
+     * @param elasticity
+     *            Elasticity of the obstacle. When in doubt, use 0
+     * @param friction
+     *            Friction of the obstacle. When in doubt, use 1
+     * @return an obstacle, which can be customized further
+     */
+    static public Obstacle addCircularObstacle(int x, int y, int width, int height, String name, Path path,
+            float pathDuration, float density, float elasticity, float friction)
+    {
+        // get image
+        TiledTextureRegion ttr = Media.getImage(name);
+        // make object
+        Obstacle o = new Obstacle(x, y, width, height, ttr);
+        // create physics
+        BodyType bt = (path == null) ? BodyType.StaticBody : BodyType.DynamicBody;
+        o.setCirclePhysics(density, elasticity, friction, bt, false, false, true);
+        // set path
+        if (path != null)
+            o.applyPath(path, pathDuration);
+        Level.current.attachChild(o);
+        return o;
+    }
+
+    /**
+     * Draw an obstacle on the screen. The obstacle's underlying physics shape
+     * is rectangular.
+     * 
+     * All obstacle behaviors begin by creating an obstacle, using either this
+     * or addCircularObstacle. Then, methods applied to the result can be used
+     * to modify the Obstacle's behavior
+     * 
+     * @param x
+     *            X coordinate of top left corner
+     * @param y
+     *            X coordinate of top left corner
+     * @param width
+     *            Width of the obstacle
+     * @param height
+     *            Height of the obstacle
+     * @param name
+     *            Name of the image file to use
+     * @param path
+     *            a Path object to describe how the obstacle moves, or null if
+     *            no path is desired
+     * @param pathDuration
+     *            The amount of time it takes for the path to complete, or 0 if
+     *            the path is null
+     * @param density
+     *            Density of the obstacle. When in doubt, use 1
+     * @param elasticity
+     *            Elasticity of the obstacle. When in doubt, use 0
+     * @param friction
+     *            Friction of the obstacle. When in doubt, use 1
+     * @return an obstacle, which can be customized further
+     */
+    static public Obstacle addSquareObstacle(int x, int y, int width, int height, String name, Path path,
+            float pathDuration, float density, float elasticity, float friction)
+    {
+        TiledTextureRegion ttr = Media.getImage(name);
+        Obstacle o = new Obstacle(x, y, width, height, ttr);
+        BodyType bt = (path == null) ? BodyType.StaticBody : BodyType.DynamicBody;
+        o.setBoxPhysics(density, elasticity, friction, bt, false, false, true);
+        if (path != null)
+            o.applyPath(path, pathDuration);
+        Level.current.attachChild(o);
+        return o;
+    }
+
+    /**
+     * Draw a box on the scene
+     * 
+     * Note: the box is actually four narrow rectangles
+     * 
+     * @param x0
+     *            X coordinate of top left corner
+     * @param y0
+     *            Y coordinate of top left corner
+     * @param x1
+     *            X coordinate of bottom right corner
+     * @param y1
+     *            Y coordinate of bottom right corner
+     * @param name
+     *            name of the image file to use when drawing the rectangles
+     * @param density
+     *            Density of the obstacle. When in doubt, use 1
+     * @param elasticity
+     *            Elasticity of the obstacle. When in doubt, use 0
+     * @param friction
+     *            Friction of the obstacle. When in doubt, use 1
+     */
+    static public void drawBoundingBox(float x0, float y0, float x1, float y1, String name, float density,
+            float elasticity, float friction)
+    {
+        // get the image by name. Note that we could animate it ;)
+        TiledTextureRegion ttr = Media.getImage(name);
+        // draw four rectangles, give them physics and attach them to the scene
+        Obstacle b = new Obstacle(x0, y1 - 1, x1, 1, ttr);
+        b.setBoxPhysics(density, elasticity, friction, BodyType.StaticBody, false, false, false);
+        Level.current.attachChild(b);
+        Obstacle t = new Obstacle(x0, y0 + 1, x1, 1, ttr);
+        t.setBoxPhysics(density, elasticity, friction, BodyType.StaticBody, false, false, false);
+        Level.current.attachChild(t);
+        Obstacle l = new Obstacle(x0, y0, 1, y1, ttr);
+        l.setBoxPhysics(density, elasticity, friction, BodyType.StaticBody, false, false, false);
+        Level.current.attachChild(l);
+        Obstacle r = new Obstacle(x1 - 1, y0, 1, y1, ttr);
+        r.setBoxPhysics(density, elasticity, friction, BodyType.StaticBody, false, false, false);
+        Level.current.attachChild(r);
+    }
+
+    /**
+     * When the scene is touched, we use this to figure out if we need to move a
+     * PokeObject
+     * 
+     * @param pScene
+     *            The scene that was touched
+     * @param te
+     *            A description of the touch event
+     */
+    static public boolean handleSceneTouch(final Scene pScene, final TouchEvent te)
+    {
+        // only do this if we have a valid scene, valid physics, a valid
+        // currentSprite, and a down press
+        if (Level.physics != null) {
+            switch (te.getAction()) {
+                case TouchEvent.ACTION_DOWN:
+                    if (currentSprite != null) {
+                        Framework.self().getEngine().vibrate(100);
+                        // move the object
+                        pokeVector.set(te.getX() / PhysicsConstants.PIXEL_TO_METER_RATIO_DEFAULT, te.getY()
+                                / PhysicsConstants.PIXEL_TO_METER_RATIO_DEFAULT);
+                        currentSprite.physBody.setTransform(pokeVector, currentSprite.physBody.getAngle());
+                        currentSprite = null;
+                        return true;
+                    }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Load an SVG line drawing generated from Inkscape.
+     * 
+     * Note that not all Inkscape drawings will work as expected. See
+     * SVGParser.java for more information.
+     * 
+     * @param name
+     *            Name of the svg file to load. It should be in the assets
+     *            folder
+     * @param r
+     *            red component of the color to use for all lines
+     * @param g
+     *            green component of the color to use for all lines
+     * @param b
+     *            blue component of the color to use for all lines
+     * @param density
+     *            density of all lines
+     * @param elasticity
+     *            elasticity of all lines
+     * @param friction
+     *            friction of all lines
+     * @param stretchX
+     *            Stretch the drawing in the X dimension by this percentage
+     * @param stretchY
+     *            Stretch the drawing in the Y dimension by this percentage
+     * @param xposeX
+     *            Shift the drawing in the X dimension. Note that shifting
+     *            occurs before scaling, which may not be the expected behavior.
+     * @param xposeY
+     *            Shift the drawing in the Y dimension. Note that shifting
+     *            occurs before scaling, which may not be the expected behavior.
+     */
+    static public void loadSVG(String name, float r, float g, float b, float density, float elasticity, float friction,
+            float stretchX, float stretchY, float xposeX, float xposeY)
+    {
+        try {
+            // create a SAX parser for SVG files
+            final SAXParserFactory spf = SAXParserFactory.newInstance();
+            final SAXParser sp = spf.newSAXParser();
+
+            final XMLReader xmlReader = sp.getXMLReader();
+            SVGParser Parser = new SVGParser();
+
+            // make the color values visible to the addLine routine of the
+            // parser
+            Parser.lineR = r;
+            Parser.lineG = g;
+            Parser.lineB = b;
+
+            // create the physics fixture in a manner that is visible to the
+            // addLine
+            // routine of the parser
+            Parser.fixture = PhysicsFactory.createFixtureDef(density, elasticity, friction);
+
+            // specify transpose and stretch information
+            Parser.userStretchX = stretchX;
+            Parser.userStretchY = stretchY;
+            Parser.userTransformX = xposeX;
+            Parser.userTransformY = xposeY;
+
+            // start parsing!
+            xmlReader.setContentHandler(Parser);
+            AssetManager am = Framework.self().getAssets();
+            InputStream inputStream = am.open(name);
+            xmlReader.parse(new InputSource(new BufferedInputStream(inputStream)));
+        }
+        // if the read fails, just print a stack trace
+        catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Called when this Obstacle is the dominant obstacle in a collision
+     * 
+     * Note: This Obstacle is /never/ the dominant obstacle in a collision,
+     * since it is #6 or #7
+     * 
+     * @param other
+     *            The other entity involved in this collision
+     */
+    void onCollide(PhysicsSprite other)
+    {
+    }
+
+    /**
+     * Whenever an Obstacle is touched, this code runs automatically.
+     * 
+     * User code should never call this directly.
+     * 
+     * @param e
+     *            Nature of the touch (down, up, etc)
+     * @param x
+     *            X position of the touch
+     * @param y
+     *            Y position of the touch
+     */
+    @Override
+    public boolean onAreaTouched(TouchEvent e, float x, float y)
+    {
+        // if the object is a drag object, then move it according to the
+        // location of the user's finger
+        if (isDrag) {
+            Framework.self().getEngine().vibrate(100);
+            float newX = e.getX() - this.getWidth() / 2;
+            float newY = e.getY() - this.getHeight() / 2;
+            this.setPosition(newX, newY);
+            dragVector.x = newX;
+            dragVector.y = newY;
+            physBody.setTransform(dragVector.mul(1 / PhysicsConstants.PIXEL_TO_METER_RATIO_DEFAULT),
+                    physBody.getAngle());
+            return true;
+        }
+        // if the object is a poke object, things are a bit more complicated
+        else if (isPoke) {
+            // only act on depress, not on release or drag
+            if (e.getAction() == MotionEvent.ACTION_DOWN) {
+                Framework.self().getEngine().vibrate(100);
+                float time = Framework.self().getEngine().getSecondsElapsedTotal();
+                if (this == currentSprite) {
+                    // double touch
+                    if ((time - lastPokeTime) < pokeDeleteThresh) {
+                        // hide sprite, disable physics, make not touchable
+                        physBody.setActive(false);
+                        Level.current.unregisterTouchArea(this);
+                        this.setVisible(false);
+                    }
+                    // repeat single-touch
+                    else {
+                        lastPokeTime = time;
+                    }
+                }
+                // new single touch
+                else {
+                    // record the active sprite
+                    currentSprite = this;
+                    lastPokeTime = time;
+                }
+            }
+            return true;
+        }
+        // remember: returning false means that this handler didn't do anything,
+        // so we should propagate the event to another handler
+        return false;
+    }
+}
